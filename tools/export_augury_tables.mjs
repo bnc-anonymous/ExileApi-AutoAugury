@@ -12,6 +12,9 @@
 // patch stops the export rather than misreading it. Unnamed columns are named Unknown1, Unknown2... by position among
 // the unnamed ones, as the memory export (AuguryTableExport) named them. First run for 3.30.0.3 (2026-11-18): the
 // tiers' mod stats matched the memory export of 2026-11-14 in all but the one stat the patch changed.
+//
+// The export's "languages" hold the texts the plugin matches the interface by, in each of the client's languages
+// (LANGUAGES), from the translated tables, for AuguryTexts.cs; since 3.30.0.4 (2026-11-20).
 import { FileLoader, toCdnUrl } from 'pathofexile-dat/bundles.js';
 import { readDatFile, getFieldReader } from 'pathofexile-dat/dat.js';
 import fs from 'node:fs/promises';
@@ -75,15 +78,19 @@ function typeOf(column) {
     };
 }
 
-/** A table's rows, each with every column that has a readable type, and _index. */
-async function table(name) {
+/**
+ * A table's rows, each with every column that has a readable type, and _index. The language is a folder under Data
+ * ("French"), where the client keeps a translated copy of each table with text in it; English is Data itself.
+ */
+async function table(name, language = ENGLISH) {
     const candidates = schema.tables.filter(t => t.name === name);
     const tableSchema = candidates.find(t => t.validFor & 1) ?? candidates[0];
 
     if (!tableSchema)
         throw new Error(`no schema for ${name}`);
 
-    const dat = readDatFile('.datc64', await loader.getFileContents(`Data/${name}.datc64`));
+    const folder = language === ENGLISH ? 'Data' : `Data/${language}`;
+    const dat = readDatFile('.datc64', await loader.getFileContents(`${folder}/${name}.datc64`));
     let offset = 0;
     let unnamed = 0;
 
@@ -115,8 +122,69 @@ async function table(name) {
         rows.push(row);
     }
 
-    console.log(`${name}: ${dat.rowCount} rows of ${dat.rowLength} bytes`);
+    console.log(`${folder}/${name}: ${dat.rowCount} rows of ${dat.rowLength} bytes`);
     return { rowLength: dat.rowLength, rows };
+}
+
+const ENGLISH = 'English';
+
+/**
+ * The client's languages, by their folder under Data: every one the 3.30.0.4 bundle index holds a translated
+ * AuguryCards for (2026-11-20); "Simplified Chinese" has none (that client is published apart).
+ */
+const LANGUAGES = [ENGLISH, 'French', 'German', 'Japanese', 'Korean', 'Portuguese', 'Russian', 'Spanish', 'Thai',
+    'Traditional Chinese'];
+
+/**
+ * The ClientStrings rows the plugin compares the interface's text with: the Fates panel's titles while choosing and
+ * at the boss, the notes the panel adds to a reward that needs two or three copies, and a Cauldron's ground label
+ * while its choice waits.
+ */
+const CLIENT_STRINGS = ['AuguryWindowSelectCard', 'AuguryWindowPlayCards', 'AuguryCardRewardTwo',
+    'AuguryCardRewardThree', 'AuguryCardSelectionWorldDescription'];
+
+/** Stops the export when a translated table's rows are not the English table's, row for row. */
+function checkSameRows(language, name, english, translated, keyOf) {
+    if (translated.rows.length !== english.rows.length)
+        throw new Error(`${language} ${name}: ${translated.rows.length} rows, English ${english.rows.length}`);
+
+    translated.rows.forEach((row, i) => {
+        if (keyOf(row) !== keyOf(english.rows[i]))
+            throw new Error(`${language} ${name} row ${i}: ${keyOf(row)}, English ${keyOf(english.rows[i])}`);
+    });
+}
+
+/**
+ * The texts the Fates panel and a Cauldron's label show, in one language: the Fates' names, the tiers' full texts
+ * and the rewards' texts, row for row with the English tables (checked by Id), and the CLIENT_STRINGS by Id.
+ */
+async function textsIn(language) {
+    const translatedCards = await table('AuguryCards', language);
+    const translatedTiers = await table('AuguryCardTiers', language);
+    const translatedRewards = await table('AuguryRewardOutcomes', language);
+    const clientStrings = await table('ClientStrings', language);
+
+    checkSameRows(language, 'AuguryCards', cards, translatedCards, r => r.Id);
+    checkSameRows(language, 'AuguryCardTiers', tiers, translatedTiers, r => `${r.Card}/${r.Tier}`);
+    checkSameRows(language, 'AuguryRewardOutcomes', rewards, translatedRewards, r => r.Id);
+
+    const strings = {};
+
+    for (const id of CLIENT_STRINGS) {
+        const row = clientStrings.rows.find(r => r.Id === id);
+
+        if (!row)
+            throw new Error(`${language} ClientStrings: no row ${id}`);
+
+        strings[id] = row.Text;
+    }
+
+    return {
+        ClientStrings: strings,
+        AuguryCards: translatedCards.rows.map(r => ({ Id: r.Id, Name: r.Name })),
+        AuguryCardTiers: translatedTiers.rows.map(r => ({ Card: r.Card, Tier: r.Tier, Body: r.Body })),
+        AuguryRewardOutcomes: translatedRewards.rows.map(r => ({ Id: r.Id, Description: r.Description })),
+    };
 }
 
 const factions = await table('AuguryFactions');
@@ -152,6 +220,11 @@ function modReference(index, withStats) {
 const reference = (tableName, rows, index) =>
     index == null ? null : { table: tableName, row: index, id: rows[index]?.Id };
 
+const languages = {};
+
+for (const language of LANGUAGES)
+    languages[language] = await textsIn(language);
+
 const exported = {
     exported: `${patch} patch files, ${new Date().toISOString().slice(0, 16).replace('T', ' ')} UTC`,
     schema: `poe-tool-dev/dat-schema schema-poe1.min.json (createdAt ${schema.createdAt}), read by pathofexile-dat`,
@@ -183,6 +256,7 @@ const exported = {
             })),
         },
     },
+    languages,
 };
 
 await fs.writeFile(outPath, JSON.stringify(exported, null, 1));

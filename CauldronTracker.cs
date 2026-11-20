@@ -80,7 +80,6 @@ internal sealed class CauldronTracker
 
     /// <summary>The Cauldron's minimap icon, as its MinimapIcon component and the icon table name it.</summary>
     public const string CauldronIconId = "AuguryEncounter";
-    private const string OwedLabelText = "Select a Fate";
 
     /// <summary>How often the entities and labels are read, in ms. Chosen: Cauldrons change at human speed.</summary>
     private const int ReadIntervalMs = 500;
@@ -454,7 +453,10 @@ internal sealed class CauldronTracker
         return tracked;
     }
 
-    /// <summary>The Cauldrons whose ground label reads "Select a Fate", by id; null when labels are unread.</summary>
+    /// <summary>
+    /// The Cauldrons whose ground label reads as a waiting Cauldron's in any of the client's languages ("Select a Fate"
+    /// in English, AuguryCatalogueLookup.IsCauldronLabel), by id; null when labels are unread.
+    /// </summary>
     private static HashSet<uint> OwedIds(GameController gc)
     {
         var ids = new HashSet<uint>();
@@ -470,7 +472,7 @@ internal sealed class CauldronTracker
             if (Safe.Read(entity, static e => e?.Path, null) != CauldronPath)
                 continue;
 
-            if (HasText(Safe.Read(label, static l => l.Label, null), OwedLabelText, 0))
+            if (HasCauldronLabel(Safe.Read(label, static l => l.Label, null), 0))
                 ids.Add(Safe.Read(entity, static e => e.Id, 0u));
         }
 
@@ -478,16 +480,18 @@ internal sealed class CauldronTracker
         return ids;
     }
 
-    /// <summary>Whether an element or one of its descendants, three levels down at most, reads the text.</summary>
-    private static bool HasText(Element element, string text, int depth)
+    /// <summary>
+    /// Whether an element or one of its descendants, three levels down at most, reads as a waiting Cauldron's label.
+    /// </summary>
+    private static bool HasCauldronLabel(Element element, int depth)
     {
         if (element == null || depth > 3)
             return false;
 
-        if (Safe.Read(element, static e => e.Text, null) == text)
+        if (AuguryCatalogueLookup.IsCauldronLabel(Safe.Read(element, static e => e.Text, null)))
             return true;
 
-        return (Safe.ChildrenOf(element) ?? []).Any(c => HasText(c, text, depth + 1));
+        return (Safe.ChildrenOf(element) ?? []).Any(c => HasCauldronLabel(c, depth + 1));
     }
 
     /// <summary>

@@ -49,7 +49,10 @@ internal sealed record FateCard(string Name, AuguryFate Fate, int? Tier, Rectang
 
 /// <summary>What FatesPanel read: whether the panel is open, in which view, and the cards of its two rows.</summary>
 /// <param name="Visible">Whether the panel is open.</param>
-/// <param name="Title">The title: "Fates" while choosing, "Invoke Fates" at the boss; empty when closed.</param>
+/// <param name="Title">
+/// The title, in the client's language: "Fates" while choosing, "Invoke Fates" at the boss in English; empty when
+/// closed.
+/// </param>
 /// <param name="Offered">
 /// The top row's visible cards: the Fates on offer while choosing; at the boss, the Fates placed in the invocation
 /// slots (an empty slot has no name and is left out).
@@ -76,16 +79,13 @@ internal sealed record FatesPanelState(bool Visible, string Title, IReadOnlyList
     IReadOnlyList<FateCard> Collection, IReadOnlyList<RectangleF> TopRowSlots, RectangleF ConfirmButton,
     RectangleF CloseButton, float HoverLift = 0f, FateCounter Counter = null)
 {
-    public const string ChoosingTitle = "Fates";
-    public const string InvokingTitle = "Invoke Fates";
-
     public static readonly FatesPanelState Closed = new(false, "", [], [], [], default, default);
 
     /// <summary>Whether the panel offers a Cauldron's Fates to choose from.</summary>
-    public bool ChoosingFate => Visible && Title == ChoosingTitle;
+    public bool ChoosingFate => Visible && AuguryCatalogueLookup.IsChoosingTitle(Title);
 
     /// <summary>Whether the panel is the boss's invocation view.</summary>
-    public bool InvokingFates => Visible && Title == InvokingTitle;
+    public bool InvokingFates => Visible && AuguryCatalogueLookup.IsInvokingTitle(Title);
 }
 
 /// <summary>
@@ -122,9 +122,10 @@ internal sealed record FateCounter(int Collected, int InArea)
 ///
 /// The layout, read off dumps of 2026-11-14 (the panel while choosing, and at the boss): the panel is a
 /// child of IngameUi whose index moves as other panels open, recognised by its title, child 2's child 3: "Fates" while
-/// choosing, "Invoke Fates" at the boss. Below child 2: [5,0] the Fate counter's text, "collected/available" ("0/4"),
-/// [6,0] the top row (the offer, or the invocation slots), [7,0] the collection, [8] a reward summary (hidden while
-/// choosing, visible at the boss), [10] the confirm button. Patch 3.30.0.4 (2026-11-19) added the counter at [5] and
+/// choosing, "Invoke Fates" at the boss, in English (AuguryCatalogueLookup knows each language's). Below child 2:
+/// [5,0] the Fate counter's text, "collected/available" ("0/4"), [6,0] the top row (the offer, or the invocation
+/// slots), [7,0] the collection, [8] a reward summary (hidden while choosing, visible at the boss), [10] the confirm
+/// button. Patch 3.30.0.4 (2026-11-19) added the counter at [5] and
 /// moved every later child up one (child 2 had 11 children before, 12 since; dumps of 22:30 to 22:36 choosing, with
 /// the counter at "0/4" to "2/4", and 22:37:09 at the boss, "4/4"). A card k's content is [k,0,0]: [4] its name,
 /// [8,0] its reward icons, each icon's child [3] the reward's text; the card element's Tooltip holds its full text.
@@ -178,7 +179,8 @@ internal sealed class FatesPanel
         var title = TitleOf(panel);
         var top = CardsOf(ChildAt(body, 6, 0));
         var bottom = CardsOf(ChildAt(body, 7, 0));
-        var (offered, collection) = WithAreaTier(top.Cards, bottom.Cards, title == FatesPanelState.ChoosingTitle);
+        var choosing = AuguryCatalogueLookup.IsChoosingTitle(title);
+        var (offered, collection) = WithAreaTier(top.Cards, bottom.Cards, choosing);
 
         _hoverLift = Math.Max(_hoverLift, Math.Max(top.Lift, bottom.Lift));
 
@@ -248,9 +250,16 @@ internal sealed class FatesPanel
         return _panel;
     }
 
-    /// <summary>Whether an element is the Fates panel: its title reads "Fates" or "Invoke Fates".</summary>
-    public static bool IsFatesPanel(Element panel) =>
-        TitleOf(panel) is FatesPanelState.ChoosingTitle or FatesPanelState.InvokingTitle;
+    /// <summary>
+    /// Whether an element is the Fates panel: its title reads as one of the panel's two in any of the client's
+    /// languages ("Fates" or "Invoke Fates" in English).
+    /// </summary>
+    public static bool IsFatesPanel(Element panel)
+    {
+        var title = TitleOf(panel);
+
+        return AuguryCatalogueLookup.IsChoosingTitle(title) || AuguryCatalogueLookup.IsInvokingTitle(title);
+    }
 
     /// <summary>The text of child 2's child 3, where the Fates panel has its title; null when there is none.</summary>
     private static string TitleOf(Element panel) => Safe.Read(ChildAt(panel, 2, 3), static t => t?.Text, null);

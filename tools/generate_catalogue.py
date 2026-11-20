@@ -1,6 +1,7 @@
-"""Write AuguryCatalogue.cs, the plugin's static Augury data, from an export of the Augury tables.
+"""Write AuguryCatalogue.cs, the plugin's static Augury data, and AuguryTexts.cs, the texts the plugin matches the
+interface by in each of the client's languages, from an export of the Augury tables.
 
-    python tools/generate_catalogue.py <augury tables export .json> [AuguryCatalogue.cs]
+    python tools/generate_catalogue.py <augury tables export .json> [AuguryCatalogue.cs] [AuguryTexts.cs]
 
 The export is written by tools/export_augury_tables.mjs from the game's patch files (since 3.30.0c, 2026-11-18), or
 was written by a development build of the plugin from memory (AuguryTableExport, not in the published plugin); both
@@ -41,7 +42,11 @@ def literal(text):
 
 
 def wrapped(text, indent):
-    """A string literal split into concatenated pieces so that no line passes WIDTH."""
+    """
+    A string literal split into concatenated pieces so that no line passes WIDTH: at spaces, and inside a word only
+    where the word alone is longer than a line (text without spaces, as Japanese and Chinese are written), never inside
+    an escape.
+    """
     whole = literal(text)
 
     if text is None or len(indent) + len(whole) + 2 <= WIDTH:
@@ -50,13 +55,20 @@ def wrapped(text, indent):
     room = WIDTH - len(indent) - 8
     pieces, current = [], ''
 
-    # Split on spaces inside the escaped text, never inside an escape.
     for word in re.findall(r'\S+\s*|\s+', literal(text)[1:-1]):
         if current and len(current) + len(word) > room:
             pieces.append(current)
             current = ''
 
-        current += word
+        if len(word) > room:
+            for token in re.findall(r'\\u[0-9A-F]{4}|\\.|.', word):
+                if len(current) + len(token) > room:
+                    pieces.append(current)
+                    current = ''
+
+                current += token
+        else:
+            current += word
 
     pieces.append(current)
 
@@ -260,6 +272,245 @@ def main():
     open(target, 'w', encoding='ascii', newline='\n').write(text)
     print('wrote %s: %d factions, %d fates, %d tiers, %d rewards, %d reward families'
           % (target, len(factions), len(fates), len(tiers), len(rewards), len(set(families_of(rewards).values()))))
+
+    write_texts(export, source, sys.argv[3] if len(sys.argv) > 3 else 'AuguryTexts.cs')
+
+
+def collapsed(text):
+    """A text as AuguryCatalogueLookup compares texts: its whitespace runs made one space, trimmed."""
+    return re.sub(r'\s+', ' ', text or '').strip()
+
+
+def note_words(note):
+    """A copies note's words without the colour markup around them: "<rgb(122,122,122)>{To claim ...}"."""
+    match = re.fullmatch(r'<[^>]*>\{(.*)\}', note or '', re.DOTALL)
+    return match.group(1) if match else note
+
+
+def texts_of(language, texts, tables, families):
+    """
+    One language's texts as AuguryTexts holds them, with the reward texts two families share in it: the interface's
+    strings; every Fate's name; each tier's full text that no other tier of its Fate shares in this language (a shared
+    one could not tell the tiers apart, so it is left out); each reward text once per tier, with the first row that has
+    it, as AuguryCatalogueLookup keeps it.
+    """
+    strings = texts['ClientStrings']
+    fate_ids = [f['Id'] for f in tables['AuguryCards']['rows']]
+    reward_tiers = {r['Id']: r['Tier'] for r in tables['AuguryRewardOutcomes']['rows']}
+
+    bodies_by_fate = {}
+
+    for tier in texts['AuguryCardTiers']:
+        bodies_by_fate.setdefault(tier['Card'], []).append(tier)
+
+    tier_texts = []
+
+    for card, tiers in bodies_by_fate.items():
+        bodies = [collapsed(t['Body']) for t in tiers]
+
+        for t in sorted(tiers, key=lambda t: t['Tier']):
+            if bodies.count(collapsed(t['Body'])) == 1:
+                tier_texts.append((fate_ids[card], t['Tier'], t['Body']))
+
+    hard_mode = {r['Id']: r['Unknown6'] == 3 for r in tables['AuguryRewardOutcomes']['rows']}
+    reward_texts, rows_by_key = [], {}
+
+    for row in texts['AuguryRewardOutcomes']:
+        key = (collapsed(row['Description']), reward_tiers[row['Id']])
+
+        if key not in rows_by_key:
+            reward_texts.append((row['Id'], row['Description']))
+
+        rows_by_key.setdefault(key, []).append(row['Id'])
+
+    shared = {}
+
+    for key, ids in rows_by_key.items():
+        named = list(dict.fromkeys(families[i] for i in ids))
+
+        if len(named) > 1:
+            only_hard_mode = all(hard_mode[i] for i in ids)
+            shared[key] = ', '.join(named) + (' (HardMode rows only)' if only_hard_mode else '')
+
+    return {
+        'language': language,
+        'choosing': strings['AuguryWindowSelectCard'],
+        'invoking': strings['AuguryWindowPlayCards'],
+        'two': note_words(strings['AuguryCardRewardTwo']),
+        'three': note_words(strings['AuguryCardRewardThree']),
+        'label': strings['AuguryCardSelectionWorldDescription'],
+        'fates': [(c['Id'], c['Name']) for c in texts['AuguryCards']],
+        'tiers': tier_texts,
+        'rewards': reward_texts,
+        'shared': shared,
+    }
+
+
+def checked_across_languages(languages, tables, families):
+    """
+    Stops on a text that would make AuguryCatalogueLookup read one thing as another, since it matches every language
+    at once: a Fate name two Fates have (in any languages, case ignored), a panel title that reads as both views, or a
+    three-copies note found inside a two-copies note. Returns the reward texts two families share across languages,
+    which the lookup takes by its first language and row, as warnings.
+    """
+    fate_of_name = {f['Id'].upper(): f['Id'] for f in tables['AuguryCards']['rows']}
+    reward_tiers = {r['Id']: r['Tier'] for r in tables['AuguryRewardOutcomes']['rows']}
+
+    for texts in languages:
+        for fate_id, name in texts['fates']:
+            known = fate_of_name.setdefault(name.strip().upper(), fate_id)
+
+            if known != fate_id:
+                raise SystemExit('%s: the Fate name "%s" is also %s' % (texts['language'], name, known))
+
+    choosing = {collapsed(t['choosing']) for t in languages}
+    invoking = {collapsed(t['invoking']) for t in languages}
+
+    if choosing & invoking:
+        raise SystemExit('a panel title reads as both views: %s' % sorted(choosing & invoking))
+
+    for a in languages:
+        for b in languages:
+            if collapsed(a['three']) in collapsed(b['two']):
+                raise SystemExit('%s three-copies note is inside the %s two-copies note' % (a['language'],
+                                                                                         b['language']))
+
+    family_of_key, warnings = {}, []
+
+    for texts in languages:
+        for reward_id, description in texts['rewards']:
+            key = (collapsed(description), reward_tiers[reward_id])
+            first = family_of_key.setdefault(key, (texts['language'], families[reward_id]))
+
+            if first[1] != families[reward_id]:
+                warnings.append('%s and %s, tier %d: %s (%s), %s (%s)' % (first[0], texts['language'], key[1],
+                                                                         first[1], first[0], families[reward_id],
+                                                                         texts['language']))
+
+    return warnings
+
+
+def write_texts(export, source, target):
+    """Writes AuguryTexts.cs, the texts the plugin matches the interface by in each language, from the export."""
+    tables = export['tables']
+    families = families_of(tables['AuguryRewardOutcomes']['rows'])
+    languages = [texts_of(name, texts, tables, families) for name, texts in export['languages'].items()]
+    across = checked_across_languages(languages, tables, families)
+
+    lines = []
+    w = lines.append
+
+    w('// Generated by tools/generate_catalogue.py on %s. Do not edit by hand: regenerate.'
+      % datetime.now().strftime('%Y-%m-%d %H:%M'))
+    w('// From %s (exported %s),'
+      % (source.replace('\\', '/').split('/')[-1], export.get('exported', '?')))
+    w('// decoded by %s.' % export.get('schema', 'dat-schema'))
+    w('')
+    w('namespace AutoAugury;')
+    w('')
+    w('/// <summary>')
+    w('/// The texts the Fates panel and a Cauldron\'s ground label show, in each of the client\'s languages,')
+    w('/// read off the game\'s translated tables (ClientStrings and the Augury tables, row for row with the')
+    w('/// English ones): the panel\'s titles, the note it adds to a reward that needs two or three copies (its')
+    w('/// words, without the colour markup), the Cauldron\'s label while its choice waits, every Fate\'s name,')
+    w('/// the tiers\' full texts and the rewards\' texts. AuguryCatalogueLookup matches against every language')
+    w('/// at once, so the client\'s language is never needed; the generator stops on a text that would read as')
+    w('/// two things across languages. Generated with AuguryCatalogue, whose English texts the settings show.')
+    w('///')
+    w('/// Kept to what matching needs: a tier\'s full text only where no other tier of its Fate reads the same')
+    w('/// in that language (the lookup could not tell those tiers apart), and a reward\'s text once per text')
+    w('/// and tier, with the first row that has it, as the lookup keeps it.')
+
+    shared = [(t['language'], key, named) for t in languages for key, named in t['shared'].items()]
+
+    if shared or across:
+        w('///')
+        w('/// Reward texts two families share, where the lookup takes the first row\'s family:')
+
+        for language, key, named in shared:
+            w('/// %s, tier %d: %s.' % (language, key[1], named))
+
+        for warning in across:
+            w('/// %s.' % warning)
+
+    w('/// </summary>')
+    w('internal static class AuguryTexts')
+    w('{')
+    w('    public static readonly AuguryLanguageTexts[] Languages =')
+    w('    [')
+
+    indent = '            '
+
+    for t in languages:
+        w('        new(%s,' % literal(t['language']))
+        w('            %s,' % wrapped(t['choosing'], indent))
+        w('            %s,' % wrapped(t['invoking'], indent))
+        w('            %s,' % wrapped(t['two'], indent))
+        w('            %s,' % wrapped(t['three'], indent))
+        w('            %s,' % wrapped(t['label'], indent))
+        w('            [')
+
+        for fate_id, name in t['fates']:
+            one_line = '                new(%s, %s),' % (literal(fate_id), literal(name))
+
+            if len(one_line) <= WIDTH:
+                w(one_line)
+            else:
+                w('                new(%s,' % literal(fate_id))
+                w('                    %s),' % wrapped(name, indent + '        '))
+
+        w('            ],')
+        w('            [')
+
+        for fate_id, tier, body in t['tiers']:
+            w('                new(%s, %d,' % (literal(fate_id), tier))
+            w('                    %s),' % wrapped(body, indent + '        '))
+
+        w('            ],')
+        w('            [')
+
+        for reward_id, description in t['rewards']:
+            w('                new(%s,' % literal(reward_id))
+            w('                    %s),' % wrapped(description, indent + '        '))
+
+        w('            ]),')
+
+    w('    ];')
+    w('}')
+    w('')
+    w('/// <summary>')
+    w('/// The texts of one client language (Language, the game\'s folder name for it): the Fates panel\'s')
+    w('/// titles while choosing and at the boss, the words of its two- and three-copies notes, a waiting')
+    w('/// Cauldron\'s label, and the Fates\' names, tiers\' full texts and rewards\' texts, each by its')
+    w('/// catalogue Id.')
+    w('/// </summary>')
+    w('internal sealed record AuguryLanguageTexts(string Language, string ChoosingTitle, string InvokingTitle,')
+    w('    string TwoCopiesNote, string ThreeCopiesNote, string CauldronLabel, AuguryFateName[] FateNames,')
+    w('    AuguryTierText[] TierTexts, AuguryRewardText[] RewardTexts);')
+    w('')
+    w('/// <summary>A Fate\'s name in one language, by the Fate\'s Id in AuguryCatalogue.</summary>')
+    w('internal sealed record AuguryFateName(string FateId, string Name);')
+    w('')
+    w('/// <summary>One tier\'s full text in one language, in the game\'s markup, by Fate Id and tier.</summary>')
+    w('internal sealed record AuguryTierText(string FateId, int Tier, string Body);')
+    w('')
+    w('/// <summary>A reward\'s text in one language, by the reward\'s Id in AuguryCatalogue.</summary>')
+    w('internal sealed record AuguryRewardText(string RewardId, string Description);')
+
+    text = '\n'.join(lines) + '\n'
+    long_lines = [i + 1 for i, line in enumerate(text.split('\n')) if len(line) > WIDTH]
+
+    if long_lines:
+        print('lines over %d columns: %s' % (WIDTH, long_lines[:20]))
+
+    open(target, 'w', encoding='ascii', newline='\n').write(text)
+    print('wrote %s: %d languages, %d KB' % (target, len(languages), len(text) // 1024))
+
+    for language, key, named in shared:
+        print('  %s, tier %d: one text for %s' % (language, key[1], named))
+
+    for warning in across:
+        print('  across languages: %s' % warning)
 
 
 if __name__ == '__main__':
